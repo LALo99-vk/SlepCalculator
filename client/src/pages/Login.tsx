@@ -124,10 +124,6 @@ const Login: React.FC = () => {
             </button>
           </div>
           
-          <div className="text-center text-sm text-gray-600 dark:text-gray-400">
-            <p>Admin credentials:</p>
-            <p><strong>Admin:</strong> admin@company.com / Admin@123</p>
-          </div>
         </form>
       </div>
     </div>
