@@ -58,9 +58,8 @@ A comprehensive web application for plastic manufacturing companies to calculate
 
 ### Backend
 - **Node.js** + **Express**
-- **MongoDB** with **Mongoose**
-- **JWT** authentication
-- **bcryptjs** for password hashing
+- **Supabase** (Postgres + Auth)
+- Single-admin authentication
 - **express-validator** for input validation
 - **multer** for file uploads
 - **puppeteer** for PDF generation
@@ -70,7 +69,7 @@ A comprehensive web application for plastic manufacturing companies to calculate
 
 ### Prerequisites
 - Node.js (v16 or higher)
-- MongoDB (local or Atlas)
+- Supabase project
 - Git
 
 ### Setup
@@ -97,9 +96,9 @@ A comprehensive web application for plastic manufacturing companies to calculate
    Edit `server/.env`:
    ```
    PORT=5000
-   MONGODB_URI=mongodb://localhost:27017/plastic-production
-   JWT_SECRET=your-super-secret-jwt-key-here
-   JWT_REFRESH_SECRET=your-super-secret-refresh-key-here
+   SUPABASE_URL=https://your-project-ref.supabase.co
+   SUPABASE_ANON_KEY=your-supabase-anon-key
+   SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
    CLIENT_URL=http://localhost:3000
    NODE_ENV=development
    ```
@@ -117,7 +116,7 @@ A comprehensive web application for plastic manufacturing companies to calculate
 
 4. **Database Setup**
    ```bash
-   # Make sure MongoDB is running, then seed the database
+   # Run schema in Supabase SQL editor, then seed initial admin/settings
    npm run seed
    ```
 
@@ -142,7 +141,7 @@ A comprehensive web application for plastic manufacturing companies to calculate
 
 ## Default Login Credentials
 
-After running the seed script, use these credentials:
+After running the seed script, use this credential:
 
 - **Admin**: admin@company.com / Admin@123
 - **Manager**: manager@company.com / Manager@123
@@ -162,7 +161,7 @@ plastic-production-system/
 │   ├── public/             # Static assets
 │   └── package.json
 ├── server/                 # Express backend
-│   ├── models/             # MongoDB models
+│   ├── supabase/           # Supabase SQL schema
 │   ├── routes/             # API routes
 │   ├── middleware/         # Custom middleware
 │   ├── seed.js             # Database seeding
@@ -284,9 +283,9 @@ Update your production environment variables:
 **Server**:
 ```
 NODE_ENV=production
-MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/plastic-production
-JWT_SECRET=your-production-jwt-secret
-JWT_REFRESH_SECRET=your-production-refresh-secret
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_ANON_KEY=your-production-anon-key
+SUPABASE_SERVICE_ROLE_KEY=your-production-service-role-key
 CLIENT_URL=https://yourdomain.com
 ```
 

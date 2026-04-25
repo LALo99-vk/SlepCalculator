@@ -1,11 +1,11 @@
 import express from 'express';
-import mongoose from 'mongoose';
 import { body, validationResult } from 'express-validator';
-import CustomRecordType, { allowedFieldTypes } from '../models/CustomRecordType.js';
-import CustomRecordEntry from '../models/CustomRecordEntry.js';
+import { supabaseAdmin } from '../lib/supabase.js';
+import { mapId, mapIds } from '../lib/transformers.js';
 import { authenticate, authorize } from '../middleware/auth.js';
 
 const router = express.Router();
+const allowedFieldTypes = ['text', 'number', 'date', 'select', 'checkbox'];
 
 const normalizeKey = (value = '') =>
   String(value)
@@ -125,10 +125,18 @@ router.use(authenticate, authorize('admin'));
 // Record types
 router.get('/', async (req, res) => {
   try {
-    const types = await CustomRecordType.find({})
-      .populate('createdBy', 'name email')
-      .sort({ createdAt: -1 });
-    res.json({ types });
+    const { data: types, error } = await supabaseAdmin
+      .from('custom_record_types')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    res.json({
+      types: mapIds(types || []).map((type) => ({
+        ...type,
+        createdBy: { _id: type.created_by, name: req.user.name, email: req.user.email },
+      })),
+    });
   } catch (error) {
     console.error('Get custom record types error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -137,9 +145,15 @@ router.get('/', async (req, res) => {
 
 router.get('/:id', async (req, res) => {
   try {
-    const type = await CustomRecordType.findById(req.params.id).populate('createdBy', 'name email');
+    const { data: type, error } = await supabaseAdmin
+      .from('custom_record_types')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (error) throw error;
     if (!type) return res.status(404).json({ message: 'Record type not found' });
-    res.json({ type });
+    const mapped = mapId(type);
+    res.json({ type: { ...mapped, createdBy: { _id: mapped.created_by, name: req.user.name, email: req.user.email } } });
   } catch (error) {
     console.error('Get custom record type error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -157,22 +171,32 @@ router.post(
       const slug = slugify(req.body.name);
       if (!slug) return res.status(400).json({ message: 'Invalid record type name' });
 
-      const existing = await CustomRecordType.findOne({ slug });
+      const { data: existing, error: existingError } = await supabaseAdmin
+        .from('custom_record_types')
+        .select('id')
+        .eq('slug', slug)
+        .maybeSingle();
+      if (existingError) throw existingError;
       if (existing) return res.status(400).json({ message: 'A record type with this name already exists' });
 
       const fields = parseFields(req.body.fields);
       const fieldError = validateFieldDefinitions(fields);
       if (fieldError) return res.status(400).json({ message: fieldError });
 
-      const type = await CustomRecordType.create({
+      const { data: type, error } = await supabaseAdmin
+        .from('custom_record_types')
+        .insert({
         name: req.body.name.trim(),
         slug,
         description: req.body.description || '',
         fields,
-        createdBy: req.user._id,
-      });
+        created_by: req.user._id,
+      })
+        .select('*')
+        .single();
+      if (error) throw error;
 
-      res.status(201).json({ type });
+      res.status(201).json({ type: mapId(type) });
     } catch (error) {
       console.error('Create custom record type error:', error);
       res.status(500).json({ message: 'Server error' });
@@ -188,32 +212,36 @@ router.put(
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ message: 'Invalid input', errors: errors.array() });
 
-      if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-        return res.status(400).json({ message: 'Invalid type id' });
-      }
-
       const slug = slugify(req.body.name);
-      const duplicate = await CustomRecordType.findOne({ slug, _id: { $ne: req.params.id } });
+      const { data: duplicateRows, error: duplicateError } = await supabaseAdmin
+        .from('custom_record_types')
+        .select('id')
+        .eq('slug', slug)
+        .neq('id', req.params.id);
+      if (duplicateError) throw duplicateError;
+      const duplicate = (duplicateRows || [])[0];
       if (duplicate) return res.status(400).json({ message: 'A record type with this name already exists' });
 
       const fields = parseFields(req.body.fields);
       const fieldError = validateFieldDefinitions(fields);
       if (fieldError) return res.status(400).json({ message: fieldError });
 
-      const type = await CustomRecordType.findByIdAndUpdate(
-        req.params.id,
-        {
+      const { data: type, error } = await supabaseAdmin
+        .from('custom_record_types')
+        .update({
           name: req.body.name.trim(),
           slug,
           description: req.body.description || '',
           fields,
-        },
-        { new: true, runValidators: true }
-      );
+        })
+        .eq('id', req.params.id)
+        .select('*')
+        .maybeSingle();
+      if (error) throw error;
 
       if (!type) return res.status(404).json({ message: 'Record type not found' });
 
-      res.json({ type });
+      res.json({ type: mapId(type) });
     } catch (error) {
       console.error('Update custom record type error:', error);
       res.status(500).json({ message: 'Server error' });
@@ -223,14 +251,16 @@ router.put(
 
 router.delete('/:id', async (req, res) => {
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-      return res.status(400).json({ message: 'Invalid type id' });
-    }
-
-    const deleted = await CustomRecordType.findByIdAndDelete(req.params.id);
+    const { data: deleted, error } = await supabaseAdmin
+      .from('custom_record_types')
+      .delete()
+      .eq('id', req.params.id)
+      .select('id')
+      .maybeSingle();
+    if (error) throw error;
     if (!deleted) return res.status(404).json({ message: 'Record type not found' });
 
-    await CustomRecordEntry.deleteMany({ recordTypeId: req.params.id });
+    await supabaseAdmin.from('custom_record_entries').delete().eq('record_type_id', req.params.id);
 
     res.json({ message: 'Record type deleted successfully' });
   } catch (error) {
@@ -242,18 +272,30 @@ router.delete('/:id', async (req, res) => {
 // Entries
 router.get('/:typeId/entries', async (req, res) => {
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.typeId)) {
-      return res.status(400).json({ message: 'Invalid type id' });
-    }
-
-    const type = await CustomRecordType.findById(req.params.typeId);
+    const { data: type, error: typeError } = await supabaseAdmin
+      .from('custom_record_types')
+      .select('*')
+      .eq('id', req.params.typeId)
+      .maybeSingle();
+    if (typeError) throw typeError;
     if (!type) return res.status(404).json({ message: 'Record type not found' });
 
-    const entries = await CustomRecordEntry.find({ recordTypeId: req.params.typeId })
-      .populate('createdBy updatedBy', 'name email')
-      .sort({ createdAt: -1 });
+    const { data: entries, error: entryError } = await supabaseAdmin
+      .from('custom_record_entries')
+      .select('*')
+      .eq('record_type_id', req.params.typeId)
+      .order('created_at', { ascending: false });
+    if (entryError) throw entryError;
 
-    res.json({ type, entries });
+    res.json({
+      type: mapId(type),
+      entries: mapIds(entries || []).map((entry) => ({
+        ...entry,
+        values: entry.values || {},
+        createdBy: { _id: entry.created_by, name: req.user.name, email: req.user.email },
+        updatedBy: { _id: entry.updated_by, name: req.user.name, email: req.user.email },
+      })),
+    });
   } catch (error) {
     console.error('Get custom record entries error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -262,24 +304,30 @@ router.get('/:typeId/entries', async (req, res) => {
 
 router.post('/:typeId/entries', async (req, res) => {
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.typeId)) {
-      return res.status(400).json({ message: 'Invalid type id' });
-    }
-
-    const type = await CustomRecordType.findById(req.params.typeId);
+    const { data: type, error: typeError } = await supabaseAdmin
+      .from('custom_record_types')
+      .select('*')
+      .eq('id', req.params.typeId)
+      .maybeSingle();
+    if (typeError) throw typeError;
     if (!type) return res.status(404).json({ message: 'Record type not found' });
 
     const { normalizedValues, error } = validateEntryValues(type.fields, req.body.values || {});
     if (error) return res.status(400).json({ message: error });
 
-    const entry = await CustomRecordEntry.create({
-      recordTypeId: type._id,
+    const { data: entry, error: entryError } = await supabaseAdmin
+      .from('custom_record_entries')
+      .insert({
+      record_type_id: type.id,
       values: normalizedValues,
-      createdBy: req.user._id,
-      updatedBy: req.user._id,
-    });
+      created_by: req.user._id,
+      updated_by: req.user._id,
+    })
+      .select('*')
+      .single();
+    if (entryError) throw entryError;
 
-    res.status(201).json({ entry });
+    res.status(201).json({ entry: mapId(entry) });
   } catch (error) {
     console.error('Create custom record entry error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -288,25 +336,29 @@ router.post('/:typeId/entries', async (req, res) => {
 
 router.put('/:typeId/entries/:entryId', async (req, res) => {
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.typeId) || !mongoose.Types.ObjectId.isValid(req.params.entryId)) {
-      return res.status(400).json({ message: 'Invalid id' });
-    }
-
-    const type = await CustomRecordType.findById(req.params.typeId);
+    const { data: type, error: typeError } = await supabaseAdmin
+      .from('custom_record_types')
+      .select('*')
+      .eq('id', req.params.typeId)
+      .maybeSingle();
+    if (typeError) throw typeError;
     if (!type) return res.status(404).json({ message: 'Record type not found' });
 
     const { normalizedValues, error } = validateEntryValues(type.fields, req.body.values || {});
     if (error) return res.status(400).json({ message: error });
 
-    const entry = await CustomRecordEntry.findOneAndUpdate(
-      { _id: req.params.entryId, recordTypeId: req.params.typeId },
-      { values: normalizedValues, updatedBy: req.user._id },
-      { new: true, runValidators: true }
-    );
+    const { data: entry, error: entryError } = await supabaseAdmin
+      .from('custom_record_entries')
+      .update({ values: normalizedValues, updated_by: req.user._id })
+      .eq('id', req.params.entryId)
+      .eq('record_type_id', req.params.typeId)
+      .select('*')
+      .maybeSingle();
+    if (entryError) throw entryError;
 
     if (!entry) return res.status(404).json({ message: 'Entry not found' });
 
-    res.json({ entry });
+    res.json({ entry: mapId(entry) });
   } catch (error) {
     console.error('Update custom record entry error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -315,14 +367,14 @@ router.put('/:typeId/entries/:entryId', async (req, res) => {
 
 router.delete('/:typeId/entries/:entryId', async (req, res) => {
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.typeId) || !mongoose.Types.ObjectId.isValid(req.params.entryId)) {
-      return res.status(400).json({ message: 'Invalid id' });
-    }
-
-    const deleted = await CustomRecordEntry.findOneAndDelete({
-      _id: req.params.entryId,
-      recordTypeId: req.params.typeId,
-    });
+    const { data: deleted, error } = await supabaseAdmin
+      .from('custom_record_entries')
+      .delete()
+      .eq('id', req.params.entryId)
+      .eq('record_type_id', req.params.typeId)
+      .select('id')
+      .maybeSingle();
+    if (error) throw error;
 
     if (!deleted) return res.status(404).json({ message: 'Entry not found' });
 

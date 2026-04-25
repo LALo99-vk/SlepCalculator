@@ -1,45 +1,55 @@
 import express from 'express';
 import { body, validationResult } from 'express-validator';
-import Calculation from '../models/Calculation.js';
-import { authenticate, authorize } from '../middleware/auth.js';
+import { supabaseAdmin } from '../lib/supabase.js';
+import { mapId } from '../lib/transformers.js';
+import { authenticate } from '../middleware/auth.js';
 
 const router = express.Router();
+
+const serializeCalculation = (row, user) => {
+  const mapped = mapId(row);
+  return {
+    ...mapped,
+    jobName: mapped.job_name,
+    createdBy: { _id: mapped.created_by, name: user.name },
+  };
+};
 
 // Get all calculations for user
 router.get('/', authenticate, async (req, res) => {
   try {
     const { page = 1, limit = 20, mode, material, startDate, endDate } = req.query;
-    
-    const query = { createdBy: req.user._id };
-    
-    // Add filters
-    if (mode && ['A', 'B'].includes(mode)) {
-      query.mode = mode;
-    }
-    
-    if (material) {
-      query['inputs.material'] = new RegExp(material, 'i');
-    }
-    
-    if (startDate && endDate) {
-      query.createdAt = {
-        $gte: new Date(startDate),
-        $lte: new Date(endDate)
-      };
-    }
+    const pageNumber = Number(page);
+    const pageSize = Number(limit);
+    const from = (pageNumber - 1) * pageSize;
+    const to = from + pageSize - 1;
 
-    const calculations = await Calculation.find(query)
-      .populate('createdBy', 'name')
-      .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
+    let query = supabaseAdmin
+      .from('calculations')
+      .select('*', { count: 'exact' })
+      .eq('created_by', req.user._id)
+      .order('created_at', { ascending: false })
+      .range(from, to);
 
-    const total = await Calculation.countDocuments(query);
+    if (mode && ['A', 'B'].includes(mode)) query = query.eq('mode', mode);
+    if (startDate && endDate) query = query.gte('created_at', startDate).lte('created_at', endDate);
+
+    const { data, error, count } = await query;
+    if (error) throw error;
+
+    const calculations = (data || [])
+      .filter((calc) => {
+        if (!material) return true;
+        return String(calc.inputs?.material || '').toLowerCase().includes(String(material).toLowerCase());
+      })
+      .map((calc) => serializeCalculation(calc, req.user));
+
+    const total = count || calculations.length;
 
     res.json({
       calculations,
       totalPages: Math.ceil(total / limit),
-      currentPage: page,
+      currentPage: pageNumber,
       total
     });
   } catch (error) {
@@ -51,16 +61,20 @@ router.get('/', authenticate, async (req, res) => {
 // Get single calculation
 router.get('/:id', authenticate, async (req, res) => {
   try {
-    const calculation = await Calculation.findOne({
-      _id: req.params.id,
-      createdBy: req.user._id
-    }).populate('createdBy', 'name');
+    const { data: calculation, error } = await supabaseAdmin
+      .from('calculations')
+      .select('*')
+      .eq('id', req.params.id)
+      .eq('created_by', req.user._id)
+      .maybeSingle();
+
+    if (error) throw error;
 
     if (!calculation) {
       return res.status(404).json({ message: 'Calculation not found' });
     }
 
-    res.json({ calculation });
+    res.json({ calculation: serializeCalculation(calculation, req.user) });
   } catch (error) {
     console.error('Get calculation error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -82,19 +96,23 @@ router.post('/', authenticate, [
 
     const { jobName, notes, mode, inputs, outputs } = req.body;
 
-    const calculation = new Calculation({
-      jobName,
+    const calculationData = {
+      job_name: jobName,
       notes,
       mode,
       inputs,
       outputs,
-      createdBy: req.user._id
-    });
+      created_by: req.user._id
+    };
 
-    await calculation.save();
-    await calculation.populate('createdBy', 'name');
+    const { data: calculation, error } = await supabaseAdmin
+      .from('calculations')
+      .insert(calculationData)
+      .select('*')
+      .single();
+    if (error) throw error;
 
-    res.status(201).json({ calculation });
+    res.status(201).json({ calculation: serializeCalculation(calculation, req.user) });
   } catch (error) {
     console.error('Create calculation error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -114,17 +132,20 @@ router.put('/:id', authenticate, [
 
     const { jobName, notes } = req.body;
 
-    const calculation = await Calculation.findOneAndUpdate(
-      { _id: req.params.id, createdBy: req.user._id },
-      { jobName, notes },
-      { new: true, runValidators: true }
-    ).populate('createdBy', 'name');
+    const { data: calculation, error } = await supabaseAdmin
+      .from('calculations')
+      .update({ job_name: jobName, notes })
+      .eq('id', req.params.id)
+      .eq('created_by', req.user._id)
+      .select('*')
+      .maybeSingle();
+    if (error) throw error;
 
     if (!calculation) {
       return res.status(404).json({ message: 'Calculation not found' });
     }
 
-    res.json({ calculation });
+    res.json({ calculation: serializeCalculation(calculation, req.user) });
   } catch (error) {
     console.error('Update calculation error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -134,10 +155,14 @@ router.put('/:id', authenticate, [
 // Delete calculation
 router.delete('/:id', authenticate, async (req, res) => {
   try {
-    const calculation = await Calculation.findOneAndDelete({
-      _id: req.params.id,
-      createdBy: req.user._id
-    });
+    const { data: calculation, error } = await supabaseAdmin
+      .from('calculations')
+      .delete()
+      .eq('id', req.params.id)
+      .eq('created_by', req.user._id)
+      .select('id')
+      .maybeSingle();
+    if (error) throw error;
 
     if (!calculation) {
       return res.status(404).json({ message: 'Calculation not found' });
@@ -153,10 +178,13 @@ router.delete('/:id', authenticate, async (req, res) => {
 // Export calculation as PDF
 router.get('/:id/pdf', authenticate, async (req, res) => {
   try {
-    const calculation = await Calculation.findOne({
-      _id: req.params.id,
-      createdBy: req.user._id
-    }).populate('createdBy', 'name');
+    const { data: calculation, error } = await supabaseAdmin
+      .from('calculations')
+      .select('id')
+      .eq('id', req.params.id)
+      .eq('created_by', req.user._id)
+      .maybeSingle();
+    if (error) throw error;
 
     if (!calculation) {
       return res.status(404).json({ message: 'Calculation not found' });

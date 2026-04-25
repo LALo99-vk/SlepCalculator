@@ -1,6 +1,7 @@
 import express from 'express';
 import { body, validationResult } from 'express-validator';
-import User from '../models/User.js';
+import { supabaseAdmin } from '../lib/supabase.js';
+import { mapId, mapIds } from '../lib/transformers.js';
 import { authenticate, authorize } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -8,11 +9,19 @@ const router = express.Router();
 // Get all users (admin only)
 router.get('/', authenticate, authorize('admin'), async (req, res) => {
   try {
-    const users = await User.find({})
-      .select('-password')
-      .sort({ createdAt: -1 });
+    const { data: users, error } = await supabaseAdmin
+      .from('admin_users')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
 
-    res.json({ users });
+    res.json({
+      users: mapIds(users || []).map((user) => ({
+        ...user,
+        role: 'admin',
+        isActive: user.is_active,
+      })),
+    });
   } catch (error) {
     console.error('Get users error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -22,13 +31,18 @@ router.get('/', authenticate, authorize('admin'), async (req, res) => {
 // Get single user (admin only)
 router.get('/:id', authenticate, authorize('admin'), async (req, res) => {
   try {
-    const user = await User.findById(req.params.id).select('-password');
+    const { data: user, error } = await supabaseAdmin
+      .from('admin_users')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (error) throw error;
 
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    res.json({ user });
+    res.json({ user: { ...mapId(user), role: 'admin', isActive: user.is_active } });
   } catch (error) {
     console.error('Get user error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -49,26 +63,34 @@ router.post('/', authenticate, authorize('admin'), [
       return res.status(400).json({ message: 'Invalid input', errors: errors.array() });
     }
 
-    const { name, email, password, company, isActive } = req.body;
-
-    // Check if user already exists
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({ message: 'User already exists with this email' });
+    const existingUsers = await supabaseAdmin.from('admin_users').select('id');
+    if ((existingUsers.data || []).length > 0) {
+      return res.status(400).json({ message: 'Only one admin authentication is allowed in this setup' });
     }
 
-    const user = new User({
-      name,
+    const { name, email, password, company, isActive } = req.body;
+
+    const { data: authUser, error: authError } = await supabaseAdmin.auth.admin.createUser({
       email,
       password,
-      role: 'admin',
-      company,
-      isActive
+      email_confirm: true,
     });
+    if (authError || !authUser?.user) throw authError || new Error('Unable to create auth user');
 
-    await user.save();
+    const { data: user, error } = await supabaseAdmin
+      .from('admin_users')
+      .insert({
+        auth_user_id: authUser.user.id,
+        name,
+        email,
+        company,
+        is_active: isActive,
+      })
+      .select('*')
+      .single();
+    if (error) throw error;
 
-    res.status(201).json({ user: user.toJSON() });
+    res.status(201).json({ user: { ...mapId(user), role: 'admin', isActive: user.is_active } });
   } catch (error) {
     console.error('Create user error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -89,30 +111,41 @@ router.put('/:id', authenticate, authorize('admin'), [
       return res.status(400).json({ message: 'Invalid input', errors: errors.array() });
     }
 
-    const { email, role, ...updateData } = req.body;
+    const { data: currentUser, error: currentUserError } = await supabaseAdmin
+      .from('admin_users')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (currentUserError) throw currentUserError;
+    if (!currentUser) return res.status(404).json({ message: 'User not found' });
 
-    // Check if email is already taken by another user
-    if (email) {
-      const existingUser = await User.findOne({ email, _id: { $ne: req.params.id } });
-      if (existingUser) {
-        return res.status(400).json({ message: 'Email already in use' });
-      }
-      updateData.email = email;
-    }
+    const updateData = {
+      name: req.body.name ?? currentUser.name,
+      email: req.body.email ?? currentUser.email,
+      company: req.body.company ?? currentUser.company,
+      is_active: req.body.isActive ?? currentUser.is_active,
+    };
 
-    updateData.role = 'admin';
-
-    const user = await User.findByIdAndUpdate(
-      req.params.id,
-      updateData,
-      { new: true, runValidators: true }
-    ).select('-password');
+    const { data: user, error } = await supabaseAdmin
+      .from('admin_users')
+      .update(updateData)
+      .eq('id', req.params.id)
+      .select('*')
+      .maybeSingle();
+    if (error) throw error;
 
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    res.json({ user });
+    if (req.body.email || req.body.password) {
+      const authPayload = {};
+      if (req.body.email) authPayload.email = req.body.email;
+      if (req.body.password) authPayload.password = req.body.password;
+      await supabaseAdmin.auth.admin.updateUserById(currentUser.auth_user_id, authPayload);
+    }
+
+    res.json({ user: { ...mapId(user), role: 'admin', isActive: user.is_active } });
   } catch (error) {
     console.error('Update user error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -122,18 +155,7 @@ router.put('/:id', authenticate, authorize('admin'), [
 // Delete user (admin only)
 router.delete('/:id', authenticate, authorize('admin'), async (req, res) => {
   try {
-    // Prevent admin from deleting themselves
-    if (req.params.id === req.user._id.toString()) {
-      return res.status(400).json({ message: 'You cannot delete your own account' });
-    }
-
-    const user = await User.findByIdAndDelete(req.params.id);
-
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-
-    res.json({ message: 'User deleted successfully' });
+    return res.status(400).json({ message: 'Deleting the only admin account is disabled for security' });
   } catch (error) {
     console.error('Delete user error:', error);
     res.status(500).json({ message: 'Server error' });

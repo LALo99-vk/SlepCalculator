@@ -1,7 +1,8 @@
 import express from 'express';
 import multer from 'multer';
 import { body, validationResult } from 'express-validator';
-import Settings from '../models/Settings.js';
+import { supabaseAdmin } from '../lib/supabase.js';
+import { mapId } from '../lib/transformers.js';
 import { authenticate, authorize } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -32,17 +33,38 @@ const upload = multer({
 // Get settings
 router.get('/', authenticate, async (req, res) => {
   try {
-    let settings = await Settings.findOne();
+    let { data: settings, error } = await supabaseAdmin
+      .from('settings')
+      .select('*')
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
     
     if (!settings) {
-      // Create default settings
-      settings = new Settings({
-        updatedBy: req.user._id
-      });
-      await settings.save();
+      const { data: createdSettings, error: createError } = await supabaseAdmin
+        .from('settings')
+        .insert({
+          updated_by: req.user._id,
+        })
+        .select('*')
+        .single();
+      if (createError) throw createError;
+      settings = createdSettings;
     }
 
-    res.json({ settings });
+    const mapped = mapId(settings);
+    res.json({
+      settings: {
+        ...mapped,
+        companyName: mapped.company_name,
+        defaultGstPercent: mapped.default_gst_percent,
+        defaultProfitMargin: mapped.default_profit_margin,
+        currencySymbol: mapped.currency_symbol,
+        decimalPrecision: mapped.decimal_precision,
+        logoUrl: mapped.logo_url,
+      },
+    });
   } catch (error) {
     console.error('Get settings error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -69,21 +91,63 @@ router.put('/', authenticate, authorize('admin'), [
     }
 
     const updateData = {
-      ...req.body,
-      updatedBy: req.user._id
+      company_name: req.body.companyName,
+      address: req.body.address,
+      phone: req.body.phone,
+      email: req.body.email,
+      gstin: req.body.gstin,
+      cin: req.body.cin,
+      default_gst_percent: req.body.defaultGstPercent,
+      default_profit_margin: req.body.defaultProfitMargin,
+      currency_symbol: req.body.currencySymbol,
+      decimal_precision: req.body.decimalPrecision,
+      updated_by: req.user._id,
     };
 
-    let settings = await Settings.findOne();
-    
+    let { data: settings, error: findError } = await supabaseAdmin
+      .from('settings')
+      .select('*')
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (findError) throw findError;
+
     if (!settings) {
-      settings = new Settings(updateData);
+      const { data: created, error: createError } = await supabaseAdmin
+        .from('settings')
+        .insert(updateData)
+        .select('*')
+        .single();
+      if (createError) throw createError;
+      settings = created;
     } else {
-      Object.assign(settings, updateData);
+      const { data: updated, error: updateError } = await supabaseAdmin
+        .from('settings')
+        .update(updateData)
+        .eq('id', settings.id)
+        .select('*')
+        .single();
+      if (updateError) throw updateError;
+      settings = updated;
     }
 
-    await settings.save();
-
-    res.json({ settings });
+    const mapped = mapId(settings);
+    res.json({
+      settings: {
+        ...mapped,
+        companyName: mapped.company_name,
+        address: mapped.address,
+        phone: mapped.phone,
+        email: mapped.email,
+        gstin: mapped.gstin,
+        cin: mapped.cin,
+        defaultGstPercent: mapped.default_gst_percent,
+        defaultProfitMargin: mapped.default_profit_margin,
+        currencySymbol: mapped.currency_symbol,
+        decimalPrecision: mapped.decimal_precision,
+        logoUrl: mapped.logo_url,
+      },
+    });
   } catch (error) {
     console.error('Update settings error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -99,19 +163,32 @@ router.post('/logo', authenticate, authorize('admin'), upload.single('logo'), as
 
     const logoUrl = `/uploads/${req.file.filename}`;
 
-    let settings = await Settings.findOne();
-    
-    if (!settings) {
-      settings = new Settings({
-        logoUrl,
-        updatedBy: req.user._id
-      });
-    } else {
-      settings.logoUrl = logoUrl;
-      settings.updatedBy = req.user._id;
-    }
+    let { data: settings, error } = await supabaseAdmin
+      .from('settings')
+      .select('*')
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
 
-    await settings.save();
+    if (!settings) {
+      const { error: createError } = await supabaseAdmin
+        .from('settings')
+        .insert({
+          logo_url: logoUrl,
+          updated_by: req.user._id
+        });
+      if (createError) throw createError;
+    } else {
+      const { error: updateError } = await supabaseAdmin
+        .from('settings')
+        .update({
+          logo_url: logoUrl,
+          updated_by: req.user._id
+        })
+        .eq('id', settings.id);
+      if (updateError) throw updateError;
+    }
 
     res.json({ logoUrl });
   } catch (error) {

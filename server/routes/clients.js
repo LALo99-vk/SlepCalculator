@@ -1,7 +1,7 @@
 import express from 'express';
 import { body, validationResult } from 'express-validator';
-import Client from '../models/Client.js';
-import Quotation from '../models/Quotation.js';
+import { supabaseAdmin } from '../lib/supabase.js';
+import { mapId, mapIds } from '../lib/transformers.js';
 import { authenticate, authorize } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -9,20 +9,19 @@ const router = express.Router();
 // Get all clients
 router.get('/', authenticate, async (req, res) => {
   try {
-    const { search } = req.query;
-    
-    const query = {};
-    
-    if (search) {
-      query.$or = [
-        { name: new RegExp(search, 'i') },
-        { company: new RegExp(search, 'i') },
-        { gstin: new RegExp(search, 'i') },
-        { email: new RegExp(search, 'i') }
-      ];
-    }
+    const { data, error } = await supabaseAdmin
+      .from('clients')
+      .select('*')
+      .order('name', { ascending: true });
+    if (error) throw error;
 
-    const clients = await Client.find(query).sort({ name: 1 });
+    const searchTerm = String(req.query.search || '').toLowerCase();
+    const clients = mapIds((data || []).filter((client) => {
+      if (!searchTerm) return true;
+      return ['name', 'company', 'gstin', 'email'].some((field) =>
+        String(client[field] || '').toLowerCase().includes(searchTerm)
+      );
+    }));
 
     res.json({ clients });
   } catch (error) {
@@ -34,13 +33,18 @@ router.get('/', authenticate, async (req, res) => {
 // Get single client
 router.get('/:id', authenticate, async (req, res) => {
   try {
-    const client = await Client.findById(req.params.id);
+    const { data: client, error } = await supabaseAdmin
+      .from('clients')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (error) throw error;
 
     if (!client) {
       return res.status(404).json({ message: 'Client not found' });
     }
 
-    res.json({ client });
+    res.json({ client: mapId(client) });
   } catch (error) {
     console.error('Get client error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -67,10 +71,14 @@ router.post('/', authenticate, authorize('admin'), [
       return res.status(400).json({ message: 'Invalid input', errors: errors.array() });
     }
 
-    const client = new Client(req.body);
-    await client.save();
+    const { data: client, error } = await supabaseAdmin
+      .from('clients')
+      .insert(req.body)
+      .select('*')
+      .single();
+    if (error) throw error;
 
-    res.status(201).json({ client });
+    res.status(201).json({ client: mapId(client) });
   } catch (error) {
     console.error('Create client error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -97,17 +105,19 @@ router.put('/:id', authenticate, authorize('admin'), [
       return res.status(400).json({ message: 'Invalid input', errors: errors.array() });
     }
 
-    const client = await Client.findByIdAndUpdate(
-      req.params.id,
-      req.body,
-      { new: true, runValidators: true }
-    );
+    const { data: client, error } = await supabaseAdmin
+      .from('clients')
+      .update(req.body)
+      .eq('id', req.params.id)
+      .select('*')
+      .maybeSingle();
+    if (error) throw error;
 
     if (!client) {
       return res.status(404).json({ message: 'Client not found' });
     }
 
-    res.json({ client });
+    res.json({ client: mapId(client) });
   } catch (error) {
     console.error('Update client error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -117,8 +127,12 @@ router.put('/:id', authenticate, authorize('admin'), [
 // Delete client
 router.delete('/:id', authenticate, authorize('admin'), async (req, res) => {
   try {
-    // Check if client has any quotations
-    const quotationCount = await Quotation.countDocuments({ 'client._id': req.params.id });
+    const { data: quotations, error: countError } = await supabaseAdmin
+      .from('quotations')
+      .select('id')
+      .eq('client_id', req.params.id);
+    if (countError) throw countError;
+    const quotationCount = quotations?.length || 0;
     
     if (quotationCount > 0) {
       return res.status(400).json({ 
@@ -126,7 +140,13 @@ router.delete('/:id', authenticate, authorize('admin'), async (req, res) => {
       });
     }
 
-    const client = await Client.findByIdAndDelete(req.params.id);
+    const { data: client, error } = await supabaseAdmin
+      .from('clients')
+      .delete()
+      .eq('id', req.params.id)
+      .select('id')
+      .maybeSingle();
+    if (error) throw error;
 
     if (!client) {
       return res.status(404).json({ message: 'Client not found' });
@@ -142,15 +162,28 @@ router.delete('/:id', authenticate, authorize('admin'), async (req, res) => {
 // Get client quotations
 router.get('/:id/quotations', authenticate, async (req, res) => {
   try {
-    const client = await Client.findById(req.params.id);
+    const { data: client, error: clientError } = await supabaseAdmin
+      .from('clients')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (clientError) throw clientError;
     
     if (!client) {
       return res.status(404).json({ message: 'Client not found' });
     }
 
-    const quotations = await Quotation.find({ 'client.name': client.name })
-      .populate('createdBy', 'name')
-      .sort({ createdAt: -1 });
+    const { data: quotationsData, error: quoteError } = await supabaseAdmin
+      .from('quotations')
+      .select('*')
+      .eq('client_id', req.params.id)
+      .order('created_at', { ascending: false });
+    if (quoteError) throw quoteError;
+
+    const quotations = mapIds(quotationsData || []).map((quotation) => ({
+      ...quotation,
+      createdBy: { _id: req.user._id, name: req.user.name },
+    }));
 
     res.json({ quotations, clientName: client.name });
   } catch (error) {

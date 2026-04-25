@@ -1,6 +1,7 @@
 import express from 'express';
 import { body, validationResult } from 'express-validator';
-import Material from '../models/Material.js';
+import { supabaseAdmin } from '../lib/supabase.js';
+import { mapId, mapIds } from '../lib/transformers.js';
 import { authenticate, authorize } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -8,25 +9,30 @@ const router = express.Router();
 // Get all materials
 router.get('/', authenticate, async (req, res) => {
   try {
-    const { type, search } = req.query;
-    
-    const query = {};
-    
-    if (type && ['PP', 'HDPE', 'LDPE', 'ABS', 'Nylon', 'PVC', 'PET', 'Custom'].includes(type)) {
-      query.type = type;
-    }
-    
-    if (search) {
-      query.$or = [
-        { name: new RegExp(search, 'i') },
-        { description: new RegExp(search, 'i') },
-        { supplierName: new RegExp(search, 'i') }
-      ];
+    let query = supabaseAdmin
+      .from('materials')
+      .select('*')
+      .order('name', { ascending: true });
+
+    if (req.query.type && ['PP', 'HDPE', 'LDPE', 'ABS', 'Nylon', 'PVC', 'PET', 'Custom'].includes(String(req.query.type))) {
+      query = query.eq('type', req.query.type);
     }
 
-    const materials = await Material.find(query)
-      .populate('updatedBy', 'name')
-      .sort({ name: 1 });
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const searchTerm = String(req.query.search || '').toLowerCase();
+    const materials = mapIds((data || []).filter((material) => {
+      if (!searchTerm) return true;
+      return ['name', 'description', 'supplier_name'].some((field) =>
+        String(material[field] || '').toLowerCase().includes(searchTerm)
+      );
+    })).map((material) => ({
+      ...material,
+      supplierName: material.supplier_name,
+      pricePerKg: material.price_per_kg,
+      updatedBy: { _id: material.updated_by, name: req.user.name },
+    }));
 
     res.json({ materials });
   } catch (error) {
@@ -38,15 +44,26 @@ router.get('/', authenticate, async (req, res) => {
 // Get single material
 router.get('/:id', authenticate, async (req, res) => {
   try {
-    const material = await Material.findById(req.params.id)
-      .populate('updatedBy', 'name')
-      .populate('priceHistory.updatedBy', 'name');
+    const { data: material, error } = await supabaseAdmin
+      .from('materials')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (error) throw error;
 
     if (!material) {
       return res.status(404).json({ message: 'Material not found' });
     }
 
-    res.json({ material });
+    const mapped = mapId(material);
+    res.json({
+      material: {
+        ...mapped,
+        supplierName: mapped.supplier_name,
+        pricePerKg: mapped.price_per_kg,
+        updatedBy: { _id: mapped.updated_by, name: req.user.name },
+      },
+    });
   } catch (error) {
     console.error('Get material error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -69,15 +86,32 @@ router.post('/', authenticate, authorize('admin'), [
     }
 
     const materialData = {
-      ...req.body,
-      updatedBy: req.user._id
+      name: req.body.name,
+      type: req.body.type,
+      price_per_kg: req.body.pricePerKg,
+      density: req.body.density,
+      description: req.body.description,
+      supplier_name: req.body.supplierName,
+      updated_by: req.user._id,
+      price_history: [{ price: req.body.pricePerKg, date: new Date().toISOString(), updatedBy: req.user._id }],
     };
 
-    const material = new Material(materialData);
-    await material.save();
-    await material.populate('updatedBy', 'name');
+    const { data: material, error } = await supabaseAdmin
+      .from('materials')
+      .insert(materialData)
+      .select('*')
+      .single();
+    if (error) throw error;
 
-    res.status(201).json({ material });
+    const mapped = mapId(material);
+    res.status(201).json({
+      material: {
+        ...mapped,
+        supplierName: mapped.supplier_name,
+        pricePerKg: mapped.price_per_kg,
+        updatedBy: { _id: mapped.updated_by, name: req.user.name },
+      },
+    });
   } catch (error) {
     console.error('Create material error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -99,22 +133,51 @@ router.put('/:id', authenticate, authorize('admin'), [
       return res.status(400).json({ message: 'Invalid input', errors: errors.array() });
     }
 
+    const { data: existing, error: existingError } = await supabaseAdmin
+      .from('materials')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (existingError) throw existingError;
+    if (!existing) return res.status(404).json({ message: 'Material not found' });
+
+    const priceHistory = Array.isArray(existing.price_history) ? [...existing.price_history] : [];
+    if (req.body.pricePerKg !== undefined && Number(req.body.pricePerKg) !== Number(existing.price_per_kg)) {
+      priceHistory.push({ price: req.body.pricePerKg, date: new Date().toISOString(), updatedBy: req.user._id });
+    }
+
     const updateData = {
-      ...req.body,
-      updatedBy: req.user._id
+      name: req.body.name ?? existing.name,
+      type: req.body.type ?? existing.type,
+      price_per_kg: req.body.pricePerKg ?? existing.price_per_kg,
+      density: req.body.density ?? existing.density,
+      description: req.body.description ?? existing.description,
+      supplier_name: req.body.supplierName ?? existing.supplier_name,
+      updated_by: req.user._id,
+      price_history: priceHistory,
     };
 
-    const material = await Material.findByIdAndUpdate(
-      req.params.id,
-      updateData,
-      { new: true, runValidators: true }
-    ).populate('updatedBy', 'name');
+    const { data: material, error } = await supabaseAdmin
+      .from('materials')
+      .update(updateData)
+      .eq('id', req.params.id)
+      .select('*')
+      .maybeSingle();
+    if (error) throw error;
 
     if (!material) {
       return res.status(404).json({ message: 'Material not found' });
     }
 
-    res.json({ material });
+    const mapped = mapId(material);
+    res.json({
+      material: {
+        ...mapped,
+        supplierName: mapped.supplier_name,
+        pricePerKg: mapped.price_per_kg,
+        updatedBy: { _id: mapped.updated_by, name: req.user.name },
+      },
+    });
   } catch (error) {
     console.error('Update material error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -124,7 +187,13 @@ router.put('/:id', authenticate, authorize('admin'), [
 // Delete material
 router.delete('/:id', authenticate, authorize('admin'), async (req, res) => {
   try {
-    const material = await Material.findByIdAndDelete(req.params.id);
+    const { data: material, error } = await supabaseAdmin
+      .from('materials')
+      .delete()
+      .eq('id', req.params.id)
+      .select('id')
+      .maybeSingle();
+    if (error) throw error;
 
     if (!material) {
       return res.status(404).json({ message: 'Material not found' });
@@ -140,9 +209,12 @@ router.delete('/:id', authenticate, authorize('admin'), async (req, res) => {
 // Get material price history
 router.get('/:id/history', authenticate, async (req, res) => {
   try {
-    const material = await Material.findById(req.params.id)
-      .populate('priceHistory.updatedBy', 'name')
-      .select('name priceHistory');
+    const { data: material, error } = await supabaseAdmin
+      .from('materials')
+      .select('id, name, price_history')
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (error) throw error;
 
     if (!material) {
       return res.status(404).json({ message: 'Material not found' });
@@ -150,7 +222,12 @@ router.get('/:id/history', authenticate, async (req, res) => {
 
     res.json({ 
       materialName: material.name,
-      priceHistory: material.priceHistory.sort((a, b) => b.date - a.date)
+      priceHistory: (material.price_history || [])
+        .map((entry) => ({
+          ...entry,
+          updatedBy: { _id: entry.updatedBy, name: req.user.name },
+        }))
+        .sort((a, b) => new Date(b.date) - new Date(a.date))
     });
   } catch (error) {
     console.error('Get price history error:', error);

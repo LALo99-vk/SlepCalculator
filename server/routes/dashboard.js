@@ -1,6 +1,5 @@
 import express from 'express';
-import Calculation from '../models/Calculation.js';
-import Quotation from '../models/Quotation.js';
+import { supabaseAdmin } from '../lib/supabase.js';
 import { authenticate } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -12,20 +11,21 @@ router.get('/summary', authenticate, async (req, res) => {
     startOfMonth.setDate(1);
     startOfMonth.setHours(0, 0, 0, 0);
 
-    // Get calculations this month
-    const totalJobs = await Calculation.countDocuments({
-      createdAt: { $gte: startOfMonth }
-    });
+    const { data: monthCalculations, error: calcError } = await supabaseAdmin
+      .from('calculations')
+      .select('outputs')
+      .gte('created_at', startOfMonth.toISOString());
+    if (calcError) throw calcError;
 
-    // Get quotations this month
-    const quotationsThisMonth = await Quotation.countDocuments({
-      createdAt: { $gte: startOfMonth }
-    });
+    const { data: monthQuotations, error: quoteError } = await supabaseAdmin
+      .from('quotations')
+      .select('id')
+      .gte('created_at', startOfMonth.toISOString());
+    if (quoteError) throw quoteError;
 
-    // Calculate average cost per piece this month
-    const calculations = await Calculation.find({
-      createdAt: { $gte: startOfMonth }
-    });
+    const calculations = monthCalculations || [];
+    const totalJobs = calculations.length;
+    const quotationsThisMonth = (monthQuotations || []).length;
 
     let avgCostPerPiece = 0;
     let avgMaterialEfficiency = 0;
@@ -59,13 +59,17 @@ router.get('/charts', authenticate, async (req, res) => {
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
     // Cost trend over last 30 calculations
-    const recentCalculations = await Calculation.find({
-      createdAt: { $gte: thirtyDaysAgo }
-    }).sort({ createdAt: 1 }).limit(30);
+    const { data: recentCalculations, error: calcError } = await supabaseAdmin
+      .from('calculations')
+      .select('outputs, created_at')
+      .gte('created_at', thirtyDaysAgo.toISOString())
+      .order('created_at', { ascending: true })
+      .limit(30);
+    if (calcError) throw calcError;
 
-    const costTrend = recentCalculations.map(calc => ({
-      date: calc.createdAt.toISOString().split('T')[0],
-      cost: calc.outputs.totalCostPerPiece || 0
+    const costTrend = (recentCalculations || []).map(calc => ({
+      date: new Date(calc.created_at).toISOString().split('T')[0],
+      cost: calc.outputs?.totalCostPerPiece || 0
     }));
 
     // Volume data by week (last 4 weeks)
@@ -79,12 +83,15 @@ router.get('/charts', authenticate, async (req, res) => {
       weekEnd.setDate(weekEnd.getDate() - (i * 7));
       weekEnd.setHours(23, 59, 59, 999);
 
-      const weekCalculations = await Calculation.find({
-        createdAt: { $gte: weekStart, $lte: weekEnd }
-      });
+      const { data: weekCalculations, error: weekError } = await supabaseAdmin
+        .from('calculations')
+        .select('outputs')
+        .gte('created_at', weekStart.toISOString())
+        .lte('created_at', weekEnd.toISOString());
+      if (weekError) throw weekError;
 
-      const totalPieces = weekCalculations.reduce((sum, calc) => 
-        sum + (calc.outputs.totalPieces || 0), 0);
+      const totalPieces = (weekCalculations || []).reduce((sum, calc) =>
+        sum + (calc.outputs?.totalPieces || 0), 0);
 
       volumeData.push({
         week: `Week ${4 - i}`,
@@ -93,14 +100,15 @@ router.get('/charts', authenticate, async (req, res) => {
     }
 
     // Quotation status distribution
-    const quotationStatus = await Quotation.aggregate([
-      {
-        $group: {
-          _id: '$status',
-          count: { $sum: 1 }
-        }
-      }
-    ]);
+    const { data: quotationRows, error: statusError } = await supabaseAdmin
+      .from('quotations')
+      .select('status');
+    if (statusError) throw statusError;
+
+    const statusCounts = {};
+    for (const row of quotationRows || []) {
+      statusCounts[row.status] = (statusCounts[row.status] || 0) + 1;
+    }
 
     const statusColors = {
       draft: '#64748b',
@@ -110,10 +118,10 @@ router.get('/charts', authenticate, async (req, res) => {
       revised: '#f59e0b'
     };
 
-    const quotationStatusData = quotationStatus.map(item => ({
-      name: item._id.charAt(0).toUpperCase() + item._id.slice(1),
-      value: item.count,
-      color: statusColors[item._id] || '#64748b'
+    const quotationStatusData = Object.entries(statusCounts).map(([status, count]) => ({
+      name: status.charAt(0).toUpperCase() + status.slice(1),
+      value: count,
+      color: statusColors[status] || '#64748b'
     }));
 
     // Material usage (mock data for now)

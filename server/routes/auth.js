@@ -1,17 +1,10 @@
 import express from 'express';
-import jwt from 'jsonwebtoken';
 import { body, validationResult } from 'express-validator';
-import User from '../models/User.js';
+import { supabaseAdmin, supabaseAuth } from '../lib/supabase.js';
+import { userPublicFields } from '../lib/transformers.js';
 import { authenticate } from '../middleware/auth.js';
 
 const router = express.Router();
-
-// Generate JWT tokens
-const generateTokens = (userId) => {
-  const accessToken = jwt.sign({ userId }, process.env.JWT_SECRET, { expiresIn: '24h' });
-  const refreshToken = jwt.sign({ userId }, process.env.JWT_REFRESH_SECRET, { expiresIn: '7d' });
-  return { accessToken, refreshToken };
-};
 
 // Login
 router.post('/login', [
@@ -26,34 +19,39 @@ router.post('/login', [
 
     const { email, password } = req.body;
 
-    // Find user
-    const user = await User.findOne({ email });
-    if (!user || !user.isActive) {
+    const { data: authLogin, error: loginError } = await supabaseAuth.auth.signInWithPassword({
+      email,
+      password,
+    });
+
+    if (loginError || !authLogin?.user || !authLogin?.session?.access_token) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    // Check password
-    const isMatch = await user.comparePassword(password);
-    if (!isMatch) {
+    const { data: adminUser, error: userError } = await supabaseAdmin
+      .from('admin_users')
+      .select('*')
+      .eq('auth_user_id', authLogin.user.id)
+      .single();
+
+    if (userError || !adminUser || !adminUser.is_active) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    // Update last login
-    user.lastLogin = new Date();
-    await user.save();
-
-    // Generate tokens
-    const { accessToken } = generateTokens(user._id);
+    await supabaseAdmin
+      .from('admin_users')
+      .update({ last_login: new Date().toISOString() })
+      .eq('id', adminUser.id);
 
     res.json({
-      token: accessToken,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        company: user.company
-      }
+      token: authLogin.session.access_token,
+      user: userPublicFields({
+        id: adminUser.id,
+        name: adminUser.name,
+        email: adminUser.email,
+        role: 'admin',
+        company: adminUser.company,
+      }),
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -64,13 +62,7 @@ router.post('/login', [
 // Get current user
 router.get('/me', authenticate, async (req, res) => {
   res.json({
-    user: {
-      id: req.user._id,
-      name: req.user.name,
-      email: req.user.email,
-      role: req.user.role,
-      company: req.user.company
-    }
+    user: userPublicFields(req.user),
   });
 });
 
@@ -87,19 +79,43 @@ router.put('/profile', authenticate, [
 
     const { name, email } = req.body;
 
-    // Check if email is already taken by another user
-    const existingUser = await User.findOne({ email, _id: { $ne: req.user._id } });
-    if (existingUser) {
+    const { data: existingUsers, error: existingError } = await supabaseAdmin
+      .from('admin_users')
+      .select('id')
+      .eq('email', email)
+      .neq('id', req.user._id);
+
+    if (existingError) {
+      throw existingError;
+    }
+
+    if (existingUsers?.length) {
       return res.status(400).json({ message: 'Email already in use' });
     }
 
-    const user = await User.findByIdAndUpdate(
-      req.user._id,
-      { name, email },
-      { new: true, runValidators: true }
-    ).select('-password');
+    const { data: user, error: updateError } = await supabaseAdmin
+      .from('admin_users')
+      .update({ name, email })
+      .eq('id', req.user._id)
+      .select('*')
+      .single();
 
-    res.json({ message: 'Profile updated successfully', user });
+    if (updateError) {
+      throw updateError;
+    }
+
+    await supabaseAdmin.auth.admin.updateUserById(req.user.authUserId, { email });
+
+    res.json({
+      message: 'Profile updated successfully',
+      user: userPublicFields({
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: 'admin',
+        company: user.company,
+      }),
+    });
   } catch (error) {
     console.error('Profile update error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -119,17 +135,21 @@ router.put('/change-password', authenticate, [
 
     const { currentPassword, newPassword } = req.body;
 
-    const user = await User.findById(req.user._id);
-    
-    // Verify current password
-    const isMatch = await user.comparePassword(currentPassword);
-    if (!isMatch) {
+    const { error: verifyError } = await supabaseAuth.auth.signInWithPassword({
+      email: req.user.email,
+      password: currentPassword,
+    });
+    if (verifyError) {
       return res.status(400).json({ message: 'Current password is incorrect' });
     }
 
-    // Update password
-    user.password = newPassword;
-    await user.save();
+    const { error: updatePasswordError } = await supabaseAdmin.auth.admin.updateUserById(req.user.authUserId, {
+      password: newPassword,
+    });
+
+    if (updatePasswordError) {
+      throw updatePasswordError;
+    }
 
     res.json({ message: 'Password changed successfully' });
   } catch (error) {
